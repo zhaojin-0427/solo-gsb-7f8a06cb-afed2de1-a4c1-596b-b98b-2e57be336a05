@@ -32,6 +32,12 @@ failure），校验每个事件是否合法，忽略违规事件并给出每个�
 按与 `/plans` 相同的规则重算指纹并精确选出目标节点及其全部传递依赖各一个
 互相一致的制品，使发布包总大小最小（详见下文对应章节）。
 
+`POST /release-transitions` 面向**发布包之间的制品切换**：沿用
+`/release-bundles` 的节点图、目标与制品字段，另给当前包 `current_ids` 与
+目标包 `next_ids`，精确求出把当前包逐步切换成目标包所需的**最少单节点替换
+步骤**，每一步之后的中间包仍须依赖一致；同长方案按整条 `(node, id)` 序列
+字典序取最小（详见下文对应章节）。
+
 `POST /release-policies` 面向**组织条款发布判定**：每条直接依赖边标记为
 `bundled`（随发布打包）或 `build_only`（仅构建期需要），仅沿 `bundled` 边取
 目标的传递闭包，检查闭包内节点携带的条款标签是否全部已履行、是否出现互斥
@@ -42,7 +48,7 @@ failure），校验每个事件是否合法，忽略违规事件并给出每个�
 
 ```
 app/
-  main.py       # FastAPI 入口：POST /plans、/impacts、/cache-retention、/execution-audits、/failure-isolation、/release-bundles、/release-policies、GET /health
+  main.py       # FastAPI 入口：POST /plans、/impacts、/cache-retention、/execution-audits、/failure-isolation、/release-bundles、/release-transitions、/release-policies、GET /health
   models.py     # 请求/响应 Pydantic 模型
   planner.py    # 图校验、指纹、拓扑排序、缓存判定与批次划分（纯函数核心）
   impacts.py    # 两图对比、根因识别与最短传导路径分析（纯函数核心）
@@ -50,6 +56,7 @@ app/
   audit.py      # 执行事件流回放与违规核查（纯函数核心）
   isolation.py  # 发布前失败隔离节点的最小成本选择（纯函数核心）
   bundles.py    # 依赖一致的发布制品包精确选择（纯函数核心）
+  transitions.py # 两个发布包之间最少单节点制品切换步骤的精确规划（纯函数核心）
   policies.py   # 组织条款标签的发布判定（纯函数核心）
 tests/
   test_planner.py
@@ -58,6 +65,7 @@ tests/
   test_audit.py
   test_isolation.py
   test_bundles.py
+  test_transitions.py
   test_policies.py
 Dockerfile
 docker-compose.yml
@@ -737,6 +745,130 @@ curl -s -X POST http://localhost:8000/release-bundles \
 }
 ```
 
+## POST /release-transitions：发布包之间的制品切换
+
+`POST /release-transitions` 在两个发布包之间规划一条**逐步切换**的路径。
+请求沿用 `/release-bundles` 的 `nodes`、`target`、`artifacts` 字段（制品
+字段同样是 `id`、`node`、`fingerprint`、`size`、`dependencies`），另给：
+
+- `current_ids`：当前发布包选出的制品 id 列表；
+- `next_ids`：期望切换到的下一个发布包的制品 id 列表。
+
+约束：
+
+- 目标的**传递依赖闭包最多 8 个节点**，闭包内每个节点提供 **1～3 件**
+  制品；所有制品都**只属于闭包内节点**（闭包外节点的制品直接报错）；
+- 制品的 `fingerprint` 与 `size` **只作元数据**：不重算、不比对指纹，
+  因此指纹过期的制品也可以作为过渡制品临时使用；
+- `current_ids` 与 `next_ids` 都必须为闭包内**每个节点恰好选择一件**
+  制品，且所选每件制品的直接依赖 id 必须落在该制品声明的可接受列表中；
+- 每一步只**替换一个节点**的制品为该节点的另一件制品（不允许原地
+  “切换”为同一件制品），切换后的中间包仍须依赖一致；允许使用只在中途
+  出现的**过渡制品**，也允许**回退**到先前使用过的制品；
+- 在所有可行切换路径中取**步骤最少**者；步骤数相同时，按整条
+  `(node, id)` 步骤序列的**字典序**取最小（先比较第 1 步的节点名，
+  再比较该步的制品 id，依次往后）；
+- 请求中节点、制品、两个 id 列表的书写顺序均不影响结果。
+
+响应字段：
+
+- `possible`：是否存在始终兼容的切换路径；
+- `steps`：最少步骤列表，每步含 `node`（被替换的节点）、`id`（切换后
+  为该节点选中的制品 id）、`bundle`（切换后**完整的“节点名 → 制品 id”
+  映射**，闭包每节点一件）；
+- 两包相同时返回 `possible=true`、空 `steps`；不存在可行路径时返回
+  `possible=false`、空 `steps`（注意这是 `200` 响应而非错误）。
+
+错误（均为 HTTP `400`）：
+
+- `unknown_target`：目标不在图中；
+- `closure_too_large`：目标依赖闭包超过 8 个节点；
+- `duplicate_artifact_id`：制品 `id` 重复；
+- `unknown_artifact_node`：制品 `node` 引用图中不存在的节点；
+- `artifact_outside_closure`：制品属于闭包外的节点；
+- `invalid_artifact_count`：闭包内某节点提供的制品数不在 1～3 之间；
+- `invalid_dependency_map`：制品的 `dependencies` 键集合与该节点的直接
+  依赖不符；
+- `unknown_artifact_reference`：可接受列表引用了未提供的制品 id；
+- `invalid_artifact_reference`：可接受 id 对应的制品属于别的节点；
+- `invalid_endpoint_bundle`：`current_ids` / `next_ids` 引用未知 id、
+  id 重复、未恰好覆盖闭包每个节点，或选出的包依赖不一致
+  （`details.current` / `details.next` 分别列出两个端点包的问题）；
+- 图本身的 `duplicate_node`、`missing_dependency`、`cycle_detected` 校验
+  与 `/plans` 一致。
+
+端点 id 列表为空、列表中出现空字符串、未知字段等由 Pydantic 拒绝
+（HTTP `422`）。
+
+### 调用示例
+
+下图是一条三节点链：`web → svc → base`。当前包是
+`{base: b1, svc: s1, web: w1}`，目标包是 `{base: b2, svc: s2, web: w2}`。
+其中 `s3` 同时接受 `b1`/`b2` 作为过渡制品，`w3` 接受所有 `svc` 制品、
+充当两个端点包之间的桥接制品：
+
+```bash
+curl -s -X POST http://localhost:8000/release-transitions \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "nodes": [
+      {"name": "base", "content_digest": "base-src", "dependency_names": []},
+      {"name": "svc",  "content_digest": "svc-src",  "dependency_names": ["base"]},
+      {"name": "web",  "content_digest": "web-src",  "dependency_names": ["svc"]}
+    ],
+    "target": "web",
+    "artifacts": [
+      {"id": "b1", "node": "base", "fingerprint": "fp-base-1", "size": 1, "dependencies": {}},
+      {"id": "b2", "node": "base", "fingerprint": "fp-base-2", "size": 1, "dependencies": {}},
+      {"id": "s1", "node": "svc",  "fingerprint": "fp-svc-1",  "size": 1, "dependencies": {"base": ["b1"]}},
+      {"id": "s2", "node": "svc",  "fingerprint": "fp-svc-2",  "size": 1, "dependencies": {"base": ["b2"]}},
+      {"id": "s3", "node": "svc",  "fingerprint": "fp-svc-3",  "size": 1, "dependencies": {"base": ["b1", "b2"]}},
+      {"id": "w1", "node": "web",  "fingerprint": "fp-web-1",  "size": 1, "dependencies": {"svc": ["s1"]}},
+      {"id": "w2", "node": "web",  "fingerprint": "fp-web-2",  "size": 1, "dependencies": {"svc": ["s2"]}},
+      {"id": "w3", "node": "web",  "fingerprint": "fp-web-3",  "size": 1, "dependencies": {"svc": ["s1", "s2", "s3"]}}
+    ],
+    "current_ids": ["b1", "s1", "w1"],
+    "next_ids": ["b2", "s2", "w2"]
+  }'
+```
+
+响应（`200 OK`）：
+
+```json
+{
+  "possible": true,
+  "steps": [
+    {"node": "web",  "id": "w3", "bundle": {"base": "b1", "svc": "s1", "web": "w3"}},
+    {"node": "svc",  "id": "s3", "bundle": {"base": "b1", "svc": "s3", "web": "w3"}},
+    {"node": "base", "id": "b2", "bundle": {"base": "b2", "svc": "s3", "web": "w3"}},
+    {"node": "svc",  "id": "s2", "bundle": {"base": "b2", "svc": "s2", "web": "w3"}},
+    {"node": "web",  "id": "w2", "bundle": {"base": "b2", "svc": "s2", "web": "w2"}}
+  ]
+}
+```
+
+解读：
+
+- 直接把 `base` 换成 `b2` 会让 `s1` 立刻失去兼容，直接把 `svc` 换成
+  `s2` 同理（`s2` 只接受 `b2`），所以必须先把 `web` 切到桥接制品 `w3`；
+- `svc` 先经过渡制品 `s3`（同时接受 `b1`/`b2`），此时底层 `base` 才能
+  从 `b1` 翻到 `b2`，随后 `svc` 落到 `s2`、`web` 落到 `w2`；
+- 5 步是最少步骤；任一中间包都仍然依赖一致；
+- 若不存在这样的桥接（例如所有 `web` 制品都只接受一个固定的 `svc`
+  制品、所有 `svc` 制品也都只接受一个固定的 `base` 制品），则返回
+  `{"possible": false, "steps": []}`；
+- 两个端点包完全相同时返回 `{"possible": true, "steps": []}`。
+
+端点包非法示例（`current_ids` 引用了不存在的制品 id，HTTP `400`）：
+
+```json
+{
+  "code": "invalid_endpoint_bundle",
+  "message": "current_ids and next_ids must each pick exactly one consistent artifact per closure node",
+  "details": {"current": {"unknown": ["ghost"]}}
+}
+```
+
 ## POST /release-policies：组织条款发布判定
 
 发布前，`POST /release-policies` 按组织自定义条款判定目标节点能否发布。请求
@@ -910,6 +1042,7 @@ level(n) = 1 + max(level(d))  for d in deps(n) if d 未命中
 | POST   | `/execution-audits`  | 按 seq 回放执行事件流，核查合法性并给出终态 |
 | POST   | `/failure-isolation` | 挑选最小成本隔离节点，阻断失败源到发布目标 |
 | POST   | `/release-bundles`    | 选择总大小最小的依赖一致发布制品包         |
+| POST   | `/release-transitions` | 规划两个发布包间最少的单节点制品切换步骤   |
 | POST   | `/release-policies`   | 沿 bundled 边闭包判定组织条款能否发布      |
 
 `/plans` 请求体字段：
@@ -977,6 +1110,20 @@ level(n) = 1 + max(level(d))  for d in deps(n) if d 未命中
 响应字段：`ready`（是否存在可行发布包）、`artifact_ids`（入选制品 id，
 排序；无解时为空表）、`total_size`（入选制品大小之和；无解时为 0）。
 
+`/release-transitions` 请求体字段：
+
+| 字段                                  | 类型                         | 说明                                           |
+|---------------------------------------|------------------------------|------------------------------------------------|
+| `nodes`                               | Node[]                       | 节点图（字段同 `/plans`）                      |
+| `target`                              | string（非空）               | 发布目标节点，必须在图中                       |
+| `artifacts`                           | BundleArtifact[]             | 闭包制品：闭包最多 8 节点，每节点 1～3 件，指纹仅作元数据 |
+| `current_ids`                         | string[]（非空表）           | 当前包的制品 id：每闭包节点恰选一件且依赖一致  |
+| `next_ids`                            | string[]（非空表）           | 目标包的制品 id：每闭包节点恰选一件且依赖一致  |
+
+响应字段：`possible`（是否存在始终兼容的切换路径）、`steps`（最少步骤，
+同长按整条 `(node, id)` 序列字典序取最小）；每步含 `node`、`id` 与
+切换后的完整映射 `bundle`；两包相同或无解时 `steps` 为空表。
+
 `/release-policies` 请求体字段：
 
 | 字段                     | 类型                                | 说明                                                |
@@ -1006,13 +1153,15 @@ uvicorn app.main:app --reload --port 8000
 pytest -q
 ```
 
-测试共 244 项，覆盖指纹公式、缓存传播、批次划分、并行/不等待命中依赖、
+测试共 282 项，覆盖指纹公式、缓存传播、批次划分、并行/不等待命中依赖、
 缺失依赖、环（含自环）、重名、顺序无关性、两图对比的根因识别、最短传导
 路径与字典序取舍、双图分别校验、缓存保留的最优选择与字典序平局取舍、
 候选上限与各类引用错误、执行事件回放的合法性与违规忽略、失败节点的
 blocked 传递、重复 seq 与未知节点错误、失败隔离的最小成本选择、字典序
 平局取舍、空路径空集合、不可阻断与各类校验错误、发布制品包的最小总大小
 选择与 id 列表字典序平局、共享依赖只计一次、闭包外制品排除、过期指纹与
-依赖不一致导致的无解、发布条款的 bundled 闭包判定、build_only 边截断、
+依赖不一致导致的无解、发布包切换的最少步骤精确求解、过渡制品与回退、
+中间包持续兼容、`(node, id)` 序列字典序平局、相同包空步骤、无解与各类
+端点包/闭包/制品数量校验错误、发布条款的 bundled 闭包判定、build_only 边截断、
 缺失标签与互斥冲突的最短来源路径及字典序取舍、边类型逐一对应校验、
 重复标签与无效互斥对错误，以及全部 HTTP 状态码。
