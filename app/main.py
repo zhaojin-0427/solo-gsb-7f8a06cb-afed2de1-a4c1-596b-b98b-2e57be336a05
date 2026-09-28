@@ -24,14 +24,17 @@ from app.models import (
     ReleaseBundleResponse,
     ReleasePolicyRequest,
     ReleasePolicyResponse,
+    ReleaseTransitionRequest,
+    ReleaseTransitionResponse,
 )
 from app.planner import PlanError, build_plan
 from app.policies import evaluate_release_policy
 from app.retention import plan_cache_retention
+from app.transitions import plan_release_transitions
 
 app = FastAPI(
     title="Incremental Build Planner",
-    version="1.6.0",
+    version="1.7.0",
     description=(
         "Computes content-addressable fingerprints over a dependency graph "
         "and schedules cache-missing nodes into parallel build batches. "
@@ -42,8 +45,10 @@ app = FastAPI(
         "chooses a minimum-cost set of nodes to isolate before release so "
         "that no failed build node can reach a release target, picks "
         "the smallest dependency-consistent artifact bundle for a release, "
-        "and evaluates organization clause tags over the bundled "
-        "dependency closure to decide whether a target may be released."
+        "plans the minimum number of dependency-consistent artifact "
+        "switches that turn one release bundle into another, and evaluates "
+        "organization clause tags over the bundled dependency closure to "
+        "decide whether a target may be released."
     ),
 )
 
@@ -110,6 +115,19 @@ async def create_release_bundle(
     request: ReleaseBundleRequest,
 ) -> ReleaseBundleResponse:
     return plan_release_bundle(request.nodes, request.target, request.artifacts)
+
+
+@app.post("/release-transitions", response_model=ReleaseTransitionResponse)
+async def create_release_transition(
+    request: ReleaseTransitionRequest,
+) -> ReleaseTransitionResponse:
+    return plan_release_transitions(
+        request.nodes,
+        request.target,
+        request.artifacts,
+        request.current_ids,
+        request.next_ids,
+    )
 
 
 @app.post("/release-policies", response_model=ReleasePolicyResponse)

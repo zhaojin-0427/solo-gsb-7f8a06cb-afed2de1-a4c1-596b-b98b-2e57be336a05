@@ -32,6 +32,11 @@ failure），校验每个事件是否合法，忽略违规事件并给出每个�
 按与 `/plans` 相同的规则重算指纹并精确选出目标节点及其全部传递依赖各一个
 互相一致的制品，使发布包总大小最小（详见下文对应章节）。
 
+`POST /release-transitions` 面向**发布包制品切换规划**：给出当前包与目标包
+各闭包节点选择的制品 id，精确求把当前包逐节点切换为目标包的**最少步骤**，
+允许经过渡制品或回退，每一步之后的中间包都必须依赖一致；同长方案按整条
+`(节点, 制品 id)` 序列字典序取最小（详见下文对应章节）。
+
 `POST /release-policies` 面向**组织条款发布判定**：每条直接依赖边标记为
 `bundled`（随发布打包）或 `build_only`（仅构建期需要），仅沿 `bundled` 边取
 目标的传递闭包，检查闭包内节点携带的条款标签是否全部已履行、是否出现互斥
@@ -42,7 +47,7 @@ failure），校验每个事件是否合法，忽略违规事件并给出每个�
 
 ```
 app/
-  main.py       # FastAPI 入口：POST /plans、/impacts、/cache-retention、/execution-audits、/failure-isolation、/release-bundles、/release-policies、GET /health
+  main.py       # FastAPI 入口：POST /plans、/impacts、/cache-retention、/execution-audits、/failure-isolation、/release-bundles、/release-transitions、/release-policies、GET /health
   models.py     # 请求/响应 Pydantic 模型
   planner.py    # 图校验、指纹、拓扑排序、缓存判定与批次划分（纯函数核心）
   impacts.py    # 两图对比、根因识别与最短传导路径分析（纯函数核心）
@@ -50,6 +55,7 @@ app/
   audit.py      # 执行事件流回放与违规核查（纯函数核心）
   isolation.py  # 发布前失败隔离节点的最小成本选择（纯函数核心）
   bundles.py    # 依赖一致的发布制品包精确选择（纯函数核心）
+  transitions.py# 发布包之间最少步骤的逐节点制品切换规划（纯函数核心）
   policies.py   # 组织条款标签的发布判定（纯函数核心）
 tests/
   test_planner.py
@@ -58,6 +64,7 @@ tests/
   test_audit.py
   test_isolation.py
   test_bundles.py
+  test_transitions.py
   test_policies.py
 Dockerfile
 docker-compose.yml
@@ -77,6 +84,26 @@ docker compose up --build
 ```bash
 curl http://localhost:8000/health
 # {"status":"ok"}
+```
+
+不使用 Docker 时，也可以直接用 uvicorn 启动（需要 Python 3.11+，依赖见
+`requirements.txt`）：
+
+```bash
+pip install -r requirements.txt
+uvicorn app.main:app --host 0.0.0.0 --port 8000
+# 开发模式（代码变更自动重载）：
+uvicorn app.main:app --reload --port 8000
+```
+
+随后即可向 <http://localhost:8000> 发送请求，例如：
+
+```bash
+curl -s http://localhost:8000/health
+curl -s -X POST http://localhost:8000/release-transitions \
+  -H 'Content-Type: application/json' \
+  -d '{"nodes":[{"name":"a","content_digest":"a","dependency_names":[]}],"target":"a","artifacts":[{"id":"a1","node":"a","fingerprint":"f1","size":1,"dependencies":{}},{"id":"a2","node":"a","fingerprint":"f2","size":1,"dependencies":{}}],"current_ids":["a1"],"next_ids":["a2"]}'
+# {"possible":true,"steps":[{"node":"a","id":"a2","bundle":{"a":"a2"}}]}
 ```
 
 ## 请求示例
@@ -737,6 +764,148 @@ curl -s -X POST http://localhost:8000/release-bundles \
 }
 ```
 
+## POST /release-transitions：发布包制品切换规划
+
+发布过程中需要把一个已经自洽的发布包逐节点切换成另一个自洽的发布包。
+`POST /release-transitions` 沿用 `/release-bundles` 的 `nodes`、`target` 与
+`artifacts` 字段（制品结构完全相同：`id`、`node`、`fingerprint`、`size`、
+`dependencies`），另给两个端点包：
+
+- `current_ids`：**当前包**选用的制品 id 列表；
+- `next_ids`：**目标包**选用的制品 id 列表。
+
+与 `/release-bundles` 不同的是：本接口中 `fingerprint` 与 `size` **只作元数据**，
+不与当前图重算指纹比较，任何非空指纹都可以参与切换规划。
+
+闭包与制品供给规则：
+
+- 目标节点及其传递依赖闭包**最多 8 个节点**（`closure_too_large`）；
+- 闭包内每个节点恰好供给 **1～3 件**制品（`invalid_artifact_count`）；
+- 每件制品都**必须属于闭包内节点**，不允许为闭包外节点供给制品
+  （`artifact_outside_closure`）；
+- 制品 `dependencies` 的键必须与该节点的直接依赖完全一致，可接受 id 必须存在且
+  属于所映射的依赖节点（校验规则与 `/release-bundles` 相同）。
+
+端点包规则（`current_ids` / `next_ids`）：
+
+- 两个包都必须为闭包内**每个节点恰选一件**制品：不可缺节点、不可两件制品属于
+  同一节点、不可引用未提供的 id、列表内 id 不可重复；
+- 对包内每件制品，其每条直接依赖边最终选定的依赖制品 id 必须出现在该制品
+  `dependencies[依赖节点名]` 的可接受列表中；
+- 任一端点包不满足上述条件即返回 `400 invalid_endpoint_bundle`
+  （`details.endpoint` 为 `"current"` 或 `"next"`，先校验 current）。
+
+切换规则：
+
+- **每一步只替换一个闭包节点**当前选用的制品（换成该节点供给的另一件制品）；
+- 允许使用**过渡制品**（目标包之外的制品只在中间步骤出现），也允许**回退**
+  （同一节点在序列中多次切换）；
+- 每个**中间包**仍须依赖一致：某件制品若不接受当前选定的依赖 id，则该切换
+  不能发生；
+- **精确求最少切换步骤**（对至多 3^8 个包状态做广度优先搜索）；步骤数相同时，
+  按整条 `(node, id)` 序列**字典序**取最小（先比节点名，再比制品 id）；
+- 两包相同：`possible=true`、`steps` 为空表；
+- 不存在始终自洽的切换序列时：`possible=false`、`steps` 为空表；
+- 请求中节点、制品以及两个 id 列表的书写顺序均不影响结果。
+
+响应字段：`possible`（是否存在可行切换序列）、`steps`（每步含 `node`——本步
+替换制品的闭包节点；`id`——切换后该节点选用的制品 id；`bundle`——**切换之后**
+整个闭包的“节点名 → 制品 id”完整映射，每节点恰一件）。
+
+错误（均为 HTTP `400`）：`unknown_target`（目标不在图中）、
+`closure_too_large`（闭包超过 8 个节点）、`duplicate_artifact_id`（制品 id
+重复）、`unknown_artifact_node`（制品引用图外节点）、
+`artifact_outside_closure`（制品属于闭包外节点）、`invalid_artifact_count`
+（闭包节点供给制品数不在 1～3 内）、`invalid_dependency_map`（依赖映射键与
+节点直接依赖不符）、`unknown_artifact_reference`（可接受列表引用未提供的
+id）、`invalid_artifact_reference`（可接受 id 属于别的节点）、
+`invalid_endpoint_bundle`（端点包缺节点/多节点/重复 id/引用未知 id/依赖不
+一致）；图本身的 `duplicate_node`、`missing_dependency`、`cycle_detected`
+校验与 `/plans` 一致。两个 id 列表为空、含空字符串、未知字段等由 Pydantic
+拒绝（HTTP `422`）。
+
+### 调用示例
+
+两个节点：`y` 依赖 `x`。当前包为 `{x: x1, y: y1}`（`y1` 只接受 `x1`），目标包
+为 `{x: x2, y: y2}`（`y2` 只接受 `x2`）。`x` 不能先换（`y1` 不接受 `x2`），
+必须先把 `y` 换到同时接受两种 `x` 的过渡制品 `yt`：
+
+```bash
+curl -s -X POST http://localhost:8000/release-transitions \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "nodes": [
+      {"name": "x", "content_digest": "x", "dependency_names": []},
+      {"name": "y", "content_digest": "y", "dependency_names": ["x"]}
+    ],
+    "target": "y",
+    "artifacts": [
+      {"id": "x1", "node": "x", "fingerprint": "f-x1", "size": 1, "dependencies": {}},
+      {"id": "x2", "node": "x", "fingerprint": "f-x2", "size": 1, "dependencies": {}},
+      {"id": "y1", "node": "y", "fingerprint": "f-y1", "size": 1, "dependencies": {"x": ["x1"]}},
+      {"id": "yt", "node": "y", "fingerprint": "f-yt", "size": 1, "dependencies": {"x": ["x1", "x2"]}},
+      {"id": "y2", "node": "y", "fingerprint": "f-y2", "size": 1, "dependencies": {"x": ["x2"]}}
+    ],
+    "current_ids": ["x1", "y1"],
+    "next_ids": ["y2", "x2"]
+  }'
+```
+
+响应（`200 OK`；注意 `next_ids` 的顺序不影响结果）：
+
+```json
+{
+  "possible": true,
+  "steps": [
+    {"node": "y", "id": "yt", "bundle": {"x": "x1", "y": "yt"}},
+    {"node": "x", "id": "x2", "bundle": {"x": "x2", "y": "yt"}},
+    {"node": "y", "id": "y2", "bundle": {"x": "x2", "y": "y2"}}
+  ]
+}
+```
+
+每步的 `bundle` 给出该步替换之后全闭包的节点→制品映射，且每一步都依赖一致：
+`(x1,y1) → (x1,yt) → (x2,yt) → (x2,y2)`，共 3 步（最少）。
+
+无切换序列示例（没有过渡制品，`y1` 只接受 `x1`、`y2` 只接受 `x2`，两个自洽包
+互不连通，HTTP `200`）：
+
+```json
+{
+  "possible": false,
+  "steps": []
+}
+```
+
+两包相同时无需任何切换：
+
+```json
+{
+  "possible": true,
+  "steps": []
+}
+```
+
+端点包非法示例（当前包缺少闭包节点 `x`，HTTP `400`）：
+
+```json
+{
+  "code": "invalid_endpoint_bundle",
+  "message": "The current_ids bundle must choose exactly one artifact for every closure node",
+  "details": {"endpoint": "current", "missing_nodes": ["x"]}
+}
+```
+
+闭包超限示例（闭包 9 个节点，HTTP `400`）：
+
+```json
+{
+  "code": "closure_too_large",
+  "message": "The target closure has 9 nodes; at most 8 are supported",
+  "details": {"nodes": 9, "limit": 8}
+}
+```
+
 ## POST /release-policies：组织条款发布判定
 
 发布前，`POST /release-policies` 按组织自定义条款判定目标节点能否发布。请求
@@ -910,6 +1079,7 @@ level(n) = 1 + max(level(d))  for d in deps(n) if d 未命中
 | POST   | `/execution-audits`  | 按 seq 回放执行事件流，核查合法性并给出终态 |
 | POST   | `/failure-isolation` | 挑选最小成本隔离节点，阻断失败源到发布目标 |
 | POST   | `/release-bundles`    | 选择总大小最小的依赖一致发布制品包         |
+| POST   | `/release-transitions`| 规划两包间最少步骤的逐节点制品切换         |
 | POST   | `/release-policies`   | 沿 bundled 边闭包判定组织条款能否发布      |
 
 `/plans` 请求体字段：
@@ -977,6 +1147,20 @@ level(n) = 1 + max(level(d))  for d in deps(n) if d 未命中
 响应字段：`ready`（是否存在可行发布包）、`artifact_ids`（入选制品 id，
 排序；无解时为空表）、`total_size`（入选制品大小之和；无解时为 0）。
 
+`/release-transitions` 请求体字段：
+
+| 字段                                  | 类型                         | 说明                                           |
+|---------------------------------------|------------------------------|------------------------------------------------|
+| `nodes`                               | Node[]                       | 节点图（字段同 `/plans`）                      |
+| `target`                              | string（非空）               | 发布目标节点，必须在图中                       |
+| `artifacts`                           | BundleArtifact[]             | 候选制品（字段同 `/release-bundles`）；每件须属于闭包节点，闭包节点各 1～3 件；指纹仅作元数据 |
+| `current_ids`                         | string[]（非空）             | 当前包选用的制品 id，每闭包节点恰一件          |
+| `next_ids`                            | string[]（非空）             | 目标包选用的制品 id，每闭包节点恰一件          |
+
+响应字段：`possible`（是否存在始终自洽的切换序列）、`steps`（最少切换步骤，
+同长按 `(node, id)` 序列字典序取最小；每步含 `node`、`id` 与切换后全闭包的
+节点→制品 id 映射 `bundle`；两包相同或无解时为空表）。
+
 `/release-policies` 请求体字段：
 
 | 字段                     | 类型                                | 说明                                                |
@@ -1006,13 +1190,16 @@ uvicorn app.main:app --reload --port 8000
 pytest -q
 ```
 
-测试共 244 项，覆盖指纹公式、缓存传播、批次划分、并行/不等待命中依赖、
+测试共 287 项，覆盖指纹公式、缓存传播、批次划分、并行/不等待命中依赖、
 缺失依赖、环（含自环）、重名、顺序无关性、两图对比的根因识别、最短传导
 路径与字典序取舍、双图分别校验、缓存保留的最优选择与字典序平局取舍、
 候选上限与各类引用错误、执行事件回放的合法性与违规忽略、失败节点的
 blocked 传递、重复 seq 与未知节点错误、失败隔离的最小成本选择、字典序
 平局取舍、空路径空集合、不可阻断与各类校验错误、发布制品包的最小总大小
 选择与 id 列表字典序平局、共享依赖只计一次、闭包外制品排除、过期指纹与
-依赖不一致导致的无解、发布条款的 bundled 闭包判定、build_only 边截断、
-缺失标签与互斥冲突的最短来源路径及字典序取舍、边类型逐一对应校验、
-重复标签与无效互斥对错误，以及全部 HTTP 状态码。
+依赖不一致导致的无解、发布包切换的最少步骤与 `(node, id)` 序列字典序
+平局取舍、过渡制品与节点多次切换（回退）、中间包依赖一致、两包相同与
+无解、闭包节点数与每节点制品数上限、闭包外制品与非法端点包等各类校验
+错误、发布条款的 bundled 闭包判定、build_only 边截断、缺失标签与互斥
+冲突的最短来源路径及字典序取舍、边类型逐一对应校验、重复标签与无效
+互斥对错误，以及全部 HTTP 状态码。

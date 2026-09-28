@@ -362,6 +362,80 @@ class ReleaseBundleResponse(BaseModel):
     )
 
 
+# --------------------------------------------------------- release transitions
+
+
+class ReleaseTransitionRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    nodes: list[Node] = Field(
+        ..., description="Build graph nodes (same schema as /plans)."
+    )
+    target: str = Field(
+        ..., min_length=1, description="Release target node (must be in the graph)."
+    )
+    artifacts: list[BundleArtifact] = Field(
+        ...,
+        description=(
+            "Offered artifacts; each must belong to a closure node, and each "
+            "closure node must offer 1..3 artifacts. Fingerprints are "
+            "metadata only and are not recomputed."
+        ),
+    )
+    current_ids: list[str] = Field(
+        ...,
+        min_length=1,
+        description="Artifact ids of the current bundle (exactly one per closure node).",
+    )
+    next_ids: list[str] = Field(
+        ...,
+        min_length=1,
+        description="Artifact ids of the desired next bundle (exactly one per closure node).",
+    )
+
+    @field_validator("current_ids", "next_ids")
+    @classmethod
+    def _validate_endpoint_ids(cls, value: list[str]) -> list[str]:
+        for artifact_id in value:
+            if not isinstance(artifact_id, str) or not artifact_id.strip():
+                raise ValueError("endpoint artifact ids must be non-empty strings")
+        return value
+
+
+class TransitionStep(BaseModel):
+    node: str = Field(
+        ..., description="Closure node whose artifact is replaced by this step."
+    )
+    id: str = Field(
+        ..., description="Artifact id chosen for `node` after the switch."
+    )
+    bundle: dict[str, str] = Field(
+        ...,
+        description=(
+            "Full node name -> artifact id mapping of the closure after the "
+            "switch (exactly one id per closure node)."
+        ),
+    )
+
+
+class ReleaseTransitionResponse(BaseModel):
+    possible: bool = Field(
+        ...,
+        description=(
+            "True when a dependency-consistent sequence of single-node "
+            "switches turns the current bundle into the next bundle."
+        ),
+    )
+    steps: list[TransitionStep] = Field(
+        ...,
+        description=(
+            "Minimum-length switch sequence; among shortest sequences the "
+            "lexicographically smallest sequence of (node, id) pairs. "
+            "Empty when the bundles are identical or when no sequence exists."
+        ),
+    )
+
+
 # ---------------------------------------------------------- release policies
 
 EdgeType = Literal["bundled", "build_only"]
